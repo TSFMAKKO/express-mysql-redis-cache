@@ -120,18 +120,18 @@ async function connectRedis() {
 }
 
 // 用於存儲待寫入數據庫的更改
-const pendingWrites = new Map();   // 用於存儲待寫入的更改
-const pendingInserts = new Map();  // 新增：用於存儲待插入的新產品
-const pendingDeletes = new Map();  // 新增：用於存儲待刪除的產品
+const pendingInserts = new Map();  // 用於存儲待寫入的新增(post)操作
+const pendingUpdates = new Map();   // 用於存儲待寫入的更新(put)操作
+const pendingDeletes = new Map();  // 用於存儲待寫入的刪除(delete)操作
 
 // 定期將快取中的更改寫入數據庫
 setInterval(async () => {
     try {
         const currentTime = new Date().toLocaleTimeString();
         
-        // 處理所有寫入操作（包括新增和更新）
-        if (pendingWrites.size > 0) {
-            console.log(`[${currentTime}] 開始處理數據庫寫入操作，待處理項目數: ${pendingWrites.size}`);
+        // 處理post操作（新增）
+        if (pendingInserts.size > 0) {
+            console.log(`[${currentTime}] 開始處理新增操作，待處理項目數: ${pendingInserts.size}`);
             
             // 獲取當前的產品列表快取
             const productsKey = 'products';
@@ -141,70 +141,76 @@ setInterval(async () => {
                 cachedProducts = JSON.parse(cachedData);
             }
             
-            for (const [key, data] of pendingWrites.entries()) {
+            for (const [tempId, data] of pendingInserts.entries()) {
                 try {
-                    const { id, name, price, description } = data;
+                    const { name, price, description } = data;
                     
-                    // 檢查是否為新增操作（id 為時間戳）
-                    if (id > 1600000000000) { // 時間戳檢查（2020年後的時間戳）
-                        // 執行插入操作
-                        const [result] = await pool.query(
-                            'INSERT INTO products (name, price, description) VALUES (?, ?, ?)',
-                            [name, price, description]
-                        );
-                        console.log(`[${currentTime}] 成功將新產品寫入數據庫，ID: ${result.insertId}`);
+                    // 執行插入操作
+                    const [result] = await pool.query(
+                        'INSERT INTO products (name, price, description) VALUES (?, ?, ?)',
+                        [name, price, description]
+                    );
+                    console.log(`[${currentTime}] 成功將新產品寫入數據庫，ID: ${result.insertId}`);
 
-                        // 更新快取中的產品ID
-                        const updatedProduct = {
-                            ...data,
-                            id: result.insertId
-                        };
+                    // 更新快取中的產品ID
+                    const updatedProduct = {
+                        ...data,
+                        id: result.insertId
+                    };
 
-                        // 更新單個產品快取
-                        const newProductKey = `product:${result.insertId}`;
-                        await redisClient.set(newProductKey, JSON.stringify(updatedProduct), {
-                            EX: 5
-                        });
+                    // 更新單個產品快取
+                    const newProductKey = `product:${result.insertId}`;
+                    await redisClient.set(newProductKey, JSON.stringify(updatedProduct), {
+                        EX: 5
+                    });
 
-                        // 清理舊的快取
-                        await redisClient.del(`product:${id}`);
+                    // 清理舊的快取
+                    await redisClient.del(`product:${tempId}`);
 
-                        // 更新產品列表快取中的對應項目
-                        const productIndex = cachedProducts.findIndex(p => p.id === id);
-                        if (productIndex !== -1) {
-                            cachedProducts[productIndex] = updatedProduct;
-                        }
-                    } else {
-                        // 執行更新操作
-                        await pool.query(
-                            'UPDATE products SET name = ?, price = ?, description = ? WHERE id = ?',
-                            [name, price, description, id]
-                        );
-                        console.log(`[${currentTime}] 成功將產品 ${id} 的更改寫入數據庫`);
-
-                        // 更新產品列表快取中的對應項目
-                        const productIndex = cachedProducts.findIndex(p => p.id === id);
-                        if (productIndex !== -1) {
-                            cachedProducts[productIndex] = data;
-                        }
+                    // 更新產品列表快取中的對應項目
+                    const productIndex = cachedProducts.findIndex(p => p.id === tempId);
+                    if (productIndex !== -1) {
+                        cachedProducts[productIndex] = updatedProduct;
                     }
                     
-                    pendingWrites.delete(key);
+                    pendingInserts.delete(tempId);
                 } catch (error) {
-                    console.error(`[${currentTime}] 寫入產品到數據庫時出錯:`, error);
+                    console.error(`[${currentTime}] 寫入新產品到數據庫時出錯:`, error);
                 }
             }
             
             // 更新產品列表快取
             if (cachedProducts.length > 0) {
                 await redisClient.set(productsKey, JSON.stringify(cachedProducts), {
-                    EX: 5 // 使用與讀取路由相同的過期時間
+                    EX: 5
                 });
                 console.log(`[${currentTime}] 已更新產品列表快取`);
             }
         }
 
-        // 處理刪除操作
+        // 處理put操作（更新）
+        if (pendingUpdates.size > 0) {
+            console.log(`[${currentTime}] 開始處理更新操作，待處理項目數: ${pendingUpdates.size}`);
+            
+            for (const [productId, data] of pendingUpdates.entries()) {
+                try {
+                    const { id, name, price, description } = data;
+                    
+                    // 執行更新操作
+                    await pool.query(
+                        'UPDATE products SET name = ?, price = ?, description = ? WHERE id = ?',
+                        [name, price, description, id]
+                    );
+                    console.log(`[${currentTime}] 成功將產品 ${id} 的更改寫入數據庫`);
+
+                    pendingUpdates.delete(productId);
+                } catch (error) {
+                    console.error(`[${currentTime}] 更新產品到數據庫時出錯:`, error);
+                }
+            }
+        }
+
+        // 處理delete操作（刪除）
         if (pendingDeletes.size > 0) {
             console.log(`[${currentTime}] 開始處理刪除操作，待處理項目數: ${pendingDeletes.size}`);
             
@@ -465,7 +471,7 @@ app.post('/api/products', async (req, res) => {
             }
 
             // 3. 將新產品加入待寫入隊列
-            pendingWrites.set(tempId, newProduct);
+            pendingInserts.set(tempId, newProduct);
             console.log(`[${currentTime}] 新產品已加入待寫入隊列，等待寫入數據庫`);
 
             // 4. 返回成功響應
@@ -477,7 +483,7 @@ app.post('/api/products', async (req, res) => {
             console.error(`[${currentTime}] 更新快取時出錯：`, cacheError);
             
             // 即使快取更新失敗，仍然將新產品加入待寫入隊列
-            pendingWrites.set(tempId, newProduct);
+            pendingInserts.set(tempId, newProduct);
             
             res.status(201).json({
                 ...newProduct,
@@ -594,7 +600,7 @@ app.put('/api/products/:id', async (req, res) => {
             console.log(`[${currentTime}] 已更新單個產品快取`);
 
             // 4. 將更新加入待寫入隊列，等待排程寫入數據庫
-            pendingWrites.set(productId, updatedProduct);
+            pendingUpdates.set(productId, updatedProduct);
             console.log(`[${currentTime}] 產品更新已加入待寫入隊列`);
 
             // 5. 返回成功響應
@@ -605,7 +611,7 @@ app.put('/api/products/:id', async (req, res) => {
         } catch (cacheError) {
             console.error(`[${currentTime}] 更新快取時出錯：`, cacheError);
             // 即使快取更新失敗，仍然將更新加入待寫入隊列
-            pendingWrites.set(productId, updatedProduct);
+            pendingUpdates.set(productId, updatedProduct);
             res.status(200).json({
                 ...updatedProduct,
                 message: '產品更新已加入待寫入隊列，但快取更新失敗'
@@ -701,23 +707,48 @@ process.on('SIGINT', async () => {
     }
 });
 
-// 初始化連接並啟動服務器
+// 啟動服務器
 async function startServer() {
     try {
-        // 測試資料庫連接
+        // 測試 MySQL 連接
+        console.log('正在測試 MySQL 連接...');
         await testMySQLConnection();
-        
+
         // 連接 Redis
+        console.log('正在連接 Redis...');
         await connectRedis();
-        
-        // 啟動服務器
+
+        // 啟動 Express 服務器
         app.listen(port, () => {
             console.log(`服務器運行在 http://localhost:${port}`);
+            console.log(`API 文檔可在 http://localhost:${port}/api-docs 查看`);
         });
     } catch (error) {
-        console.error('啟動服務器失敗:', error);
+        console.error('服務器啟動失敗:', error);
+        if (error.code === 'ECONNREFUSED' && error.address === '127.0.0.1') {
+            if (error.port === 3306) {
+                console.error('無法連接到 MySQL 服務器。請確保：');
+                console.error('1. MySQL 服務正在運行');
+                console.error('2. MySQL 密碼配置正確');
+                console.error('3. MySQL 服務器地址和端口正確');
+            } else if (error.port === 6379) {
+                console.error('無法連接到 Redis 服務器。請確保：');
+                console.error('1. Redis 服務正在運行');
+                console.error('2. Redis 服務器地址和端口正確');
+            }
+        } else if (error.code === 'ER_ACCESS_DENIED_ERROR') {
+            console.error('MySQL 訪問被拒絕。請檢查用戶名和密碼配置。');
+        } else if (error.code === 'ER_BAD_DB_ERROR') {
+            console.error('數據庫不存在。請先創建數據庫並執行初始化腳本。');
+            console.error('可以使用以下命令創建數據庫：');
+            console.error('1. mysql -u root -p');
+            console.error('2. CREATE DATABASE test_db;');
+            console.error('3. USE test_db;');
+            console.error('4. 執行 init.sql 文件中的 SQL 語句');
+        }
         process.exit(1);
     }
 }
 
+// 啟動服務器
 startServer(); 
